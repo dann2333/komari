@@ -138,6 +138,11 @@ func (s *Store) ImportRollups(ctx context.Context, rollups []PersistedRollup) er
 	}
 	s.retentionMu.RLock()
 	defer s.retentionMu.RUnlock()
+	s.ingestMu.Lock()
+	defer s.ingestMu.Unlock()
+	if err := s.ensureOpen(); err != nil {
+		return err
+	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

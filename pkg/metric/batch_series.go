@@ -174,6 +174,9 @@ func (s *Store) seriesBatchDefined(ctx context.Context, query BatchSeriesQuery, 
 	// disappears between dictionary lookup and backing-tier selection.
 	s.rollupViewMu.RLock()
 	defer s.rollupViewMu.RUnlock()
+	if err := s.ensureOpen(); err != nil {
+		return BatchSeriesResult{}, err
+	}
 	seriesByID, seriesByIdentity, err := s.loadSeriesDictionary(ctx, seriesDictionaryPlan{MetricNames: metricNames, EntityIDs: query.EntityIDs, Tags: query.Tags, OmitTags: query.OmitTags})
 	if err != nil {
 		return BatchSeriesResult{}, err
@@ -290,6 +293,44 @@ func (s *Store) loadSeriesDictionary(ctx context.Context, plan seriesDictionaryP
 	return byID, byIdentity, rows.Err()
 }
 
+// persistedReplacementKey identifies a database row hidden by a staged raw
+// replacement. The surrounding rollup view lock freezes both representations.
+type persistedReplacementKey struct{ seriesID, labelID, bucket int64 }
+
+func (s *Store) persistedReplacements(ctx context.Context, seriesByID map[int64]*seriesReadMeta) (map[persistedReplacementKey]struct{}, error) {
+	series := make(map[seriesIdentity]int64, len(seriesByID))
+	for id, meta := range seriesByID {
+		series[seriesIdentity{metricName: meta.metricName, entityID: meta.entityID, tagsHash: meta.tagsHash}] = id
+	}
+	s.hotMu.RLock()
+	keys := make([]hotRollupKey, 0, len(s.hotReplace))
+	for key := range s.hotReplace {
+		keys = append(keys, key)
+	}
+	s.hotMu.RUnlock()
+	out := make(map[persistedReplacementKey]struct{})
+	labels := make(map[string]int64)
+	for _, key := range keys {
+		seriesID, ok := series[seriesIdentity{metricName: key.metricName, entityID: key.entityID, tagsHash: key.tagsHash}]
+		if !ok {
+			continue
+		}
+		labelID, ok := labels[key.labelsHash]
+		if !ok {
+			err := s.reader().QueryRowContext(ctx, "SELECT id FROM "+s.tables.labels+" WHERE labels_hash = "+s.dialect.placeholder(1), key.labelsHash).Scan(&labelID)
+			if err == sql.ErrNoRows {
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+			labels[key.labelsHash] = labelID
+		}
+		out[persistedReplacementKey{seriesID, labelID, key.bucket}] = struct{}{}
+	}
+	return out, nil
+}
+
 func (s *Store) scanPersistedRollupGroup(ctx context.Context, query BatchSeriesQuery, group *batchSeriesGroup, seriesByID map[int64]*seriesReadMeta, accumulators map[string]*metricSeriesAccumulator) error {
 	seriesIDs := make([]int64, 0)
 	for seriesID, meta := range seriesByID {
@@ -305,7 +346,15 @@ func (s *Store) scanPersistedRollupGroup(ctx context.Context, query BatchSeriesQ
 	if err != nil || !found {
 		return err
 	}
+	var replacements map[persistedReplacementKey]struct{}
+	if group.key.resolution == time.Minute {
+		replacements, err = s.persistedReplacements(ctx, seriesByID)
+		if err != nil {
+			return err
+		}
+	}
 	plan := rollupReadPlan{
+		WithLabelID:  len(replacements) != 0,
 		SeriesIDs:    seriesIDs,
 		ResolutionID: resolutionID,
 		StartMilli:   bucketStartMillis(query.Start.UnixMilli(), group.key.resolution.Milliseconds()),
@@ -314,7 +363,7 @@ func (s *Store) scanPersistedRollupGroup(ctx context.Context, query BatchSeriesQ
 	}
 	indexName := plan.indexName(s.cfg.TablePrefix)
 	return forEachRollupReadPlan(s.cfg.Driver, plan, func(chunk rollupReadPlan) error {
-		return s.scanPersistedRollupPlan(ctx, chunk, indexName, seriesByID, accumulators)
+		return s.scanPersistedRollupPlan(ctx, chunk, indexName, seriesByID, accumulators, replacements)
 	})
 }
 
@@ -337,17 +386,20 @@ func forEachRollupReadPlan(driver Driver, plan rollupReadPlan, consume func(roll
 	return nil
 }
 
-func (s *Store) scanPersistedRollupPlan(ctx context.Context, plan rollupReadPlan, indexName string, seriesByID map[int64]*seriesReadMeta, accumulators map[string]*metricSeriesAccumulator) error {
+func (s *Store) scanPersistedRollupPlan(ctx context.Context, plan rollupReadPlan, indexName string, seriesByID map[int64]*seriesReadMeta, accumulators map[string]*metricSeriesAccumulator, replacements map[persistedReplacementKey]struct{}) error {
 	rendered := s.dialect.renderRollupRead(s.tables, indexName, plan)
 	rows, err := s.reader().QueryContext(ctx, rendered.Query, rendered.Args...)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
-	var seriesID, bucket, count, firstTS, lastTS int64
+	var seriesID, bucket, count, labelID, firstTS, lastTS int64
 	var sum, sumSq, min, max, firstVal, lastVal float64
 	var digestBlob []byte
 	destinations := []any{&seriesID, &bucket, &count}
+	if plan.WithLabelID {
+		destinations = append(destinations, &labelID)
+	}
 	if plan.Fields&rollupReadSum != 0 {
 		destinations = append(destinations, &sum)
 	}
@@ -373,6 +425,9 @@ func (s *Store) scanPersistedRollupPlan(ctx context.Context, plan rollupReadPlan
 		err = rows.Scan(destinations...)
 		if err != nil {
 			return err
+		}
+		if _, replaced := replacements[persistedReplacementKey{seriesID, labelID, bucket}]; plan.WithLabelID && replaced {
+			continue
 		}
 		meta := seriesByID[seriesID]
 		accumulator := accumulators[meta.metricName]

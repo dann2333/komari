@@ -60,6 +60,14 @@ type Store struct {
 	// ingestMu keeps the exact-sample upsert and its hot-rollup update atomic
 	// with respect to other writers.
 	ingestMu sync.Mutex
+	// Retry batches and marker tokens are protected by ingestMu and rollupViewMu.
+	retryHot            []hotRollup
+	retryHotToken       string
+	retryHotAt          time.Time
+	retryCoarse         []closedCoarseRollup
+	retryCoarseToken    string
+	retryCoarseAt       time.Time
+	confirmedFlushToken string
 	// rollupViewMu keeps persisted and hot rollups as one queryable view while
 	// closed buckets move into the database or replace an earlier summary.
 	rollupViewMu sync.RWMutex
@@ -68,9 +76,10 @@ type Store struct {
 	raw   map[rawSeriesKey]*rawSeries
 	// hotMu protects minute summaries that may still receive an exact upsert
 	// from the ten-minute raw window. Exact samples are never persisted.
-	hotMu      sync.RWMutex
-	hot        map[hotRollupKey]*rollupBucket
-	hotReplace map[hotRollupKey]struct{}
+	hotMu            sync.RWMutex
+	hot              map[hotRollupKey]*rollupBucket
+	hotReplace       map[hotRollupKey]struct{}
+	hotReplaceGroups map[hotReplacementGroup]map[hotRollupKey]struct{}
 	// hotOldest is a lower bound on every hot key's bucket, letting a write
 	// skip the closed-bucket scan. Zero forces a scan that recomputes it.
 	hotOldest int64
@@ -89,7 +98,8 @@ type Store struct {
 	// closed reports whether Close has been called.
 	//
 	// closed 表示 Close 是否已经被调用。
-	closed bool
+	closed         bool
+	flushUncertain bool
 	// definitionCache memoizes retention days by metric name for the write
 	// path. Every definition change made through this Store invalidates it;
 	// definitionCacheTTL bounds staleness from changes made elsewhere.
@@ -412,26 +422,57 @@ func durationMillis(d time.Duration) int {
 //
 // Close 关闭 Store 拥有的连接池；外部传入的 DB 不会被关闭。
 func (s *Store) Close() error {
-	// Block new writes, mark the store closed, then persist the remaining partial
-	// minute before closing owned pools. A clean shutdown should not discard the
+	// Block new writes and persist the remaining partial minute before marking
+	// the store closed and closing owned pools. A clean shutdown should not discard the
 	// last observations merely because their wall-clock minute has not ended.
 	s.retentionMu.Lock()
 	defer s.retentionMu.Unlock()
 
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
+	// Resolve an ambiguous commit before closing the database or its buffers.
+	s.mu.RLock()
+	uncertain := s.flushUncertain
+	s.mu.RUnlock()
+	if uncertain {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		s.ingestMu.Lock()
+		s.rollupViewMu.Lock()
+		var err error
+		if len(s.retryHot) != 0 {
+			_, err = s.flushClosedHotRollupsUnderView(ctx, time.Now().UTC())
+		} else if len(s.retryCoarse) != 0 {
+			_, err = s.flushClosedCoarseRollupsUnderView(ctx, time.Now().UTC())
+		} else {
+			err = ErrFlushCommitUncertain
+		}
+		s.rollupViewMu.Unlock()
+		s.ingestMu.Unlock()
+		cancel()
+		if err != nil {
+			return err
+		}
+	}
+	s.mu.RLock()
+	closed := s.closed
+	s.mu.RUnlock()
+	if closed {
 		return nil
 	}
+
+	flushCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	err := s.flushAllHotRollups(flushCtx)
+	cancel()
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
 	s.closed = true
 	s.mu.Unlock()
-
 	var firstErr error
-	flushCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	if err := s.flushAllHotRollups(flushCtx); err != nil {
-		firstErr = err
+	if s.confirmedFlushToken != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_, _ = s.db.ExecContext(ctx, "DELETE FROM "+s.tables.state+" WHERE state_key = "+s.dialect.placeholder(1), s.confirmedFlushToken)
+		cancel()
 	}
-	cancel()
 	s.rawMu.Lock()
 	s.raw = nil
 	s.rawMu.Unlock()
@@ -476,6 +517,13 @@ func (s *Store) ExecContext(ctx context.Context, query string, args ...any) (sql
 	if err := s.ensureOpen(); err != nil {
 		return nil, err
 	}
+	s.retentionMu.RLock()
+	defer s.retentionMu.RUnlock()
+	s.ingestMu.Lock()
+	defer s.ingestMu.Unlock()
+	if err := s.ensureOpen(); err != nil {
+		return nil, err
+	}
 	defer s.invalidateDefinitionCache()
 	return s.db.ExecContext(ctx, query, args...)
 }
@@ -488,6 +536,9 @@ func (s *Store) ensureOpen() error {
 	defer s.mu.RUnlock()
 	if s.closed {
 		return ErrClosed
+	}
+	if s.flushUncertain {
+		return ErrFlushCommitUncertain
 	}
 	if s.db == nil {
 		return ErrClosed
@@ -554,11 +605,10 @@ func (s *Store) UpsertMetric(ctx context.Context, def Definition) error {
 	if err := def.Validate(); err != nil {
 		return err
 	}
-	if def.RetentionDays == 0 {
-		// Serialize the zero-retention transition with writes and compaction before
-		// changing the definition or removing data left by an enabled definition.
-		s.retentionMu.Lock()
-		defer s.retentionMu.Unlock()
+	s.retentionMu.Lock()
+	defer s.retentionMu.Unlock()
+	if err := s.ensureOpen(); err != nil {
+		return err
 	}
 	defer s.invalidateDefinitionCache()
 	metadata, err := encodeMap(def.Metadata)
@@ -645,6 +695,9 @@ func (s *Store) DeleteMetric(ctx context.Context, name string) error {
 	}
 	s.retentionMu.Lock()
 	defer s.retentionMu.Unlock()
+	if err := s.ensureOpen(); err != nil {
+		return err
+	}
 	defer s.invalidateDefinitionCache()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -684,6 +737,9 @@ func (s *Store) UpdateMetricRetention(ctx context.Context, name string, retentio
 
 	s.retentionMu.Lock()
 	defer s.retentionMu.Unlock()
+	if err := s.ensureOpen(); err != nil {
+		return Definition{}, err
+	}
 	defer s.invalidateDefinitionCache()
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -731,6 +787,9 @@ func (s *Store) SetMetricRetention(ctx context.Context, name string, retentionDa
 
 	s.retentionMu.Lock()
 	defer s.retentionMu.Unlock()
+	if err := s.ensureOpen(); err != nil {
+		return Definition{}, err
+	}
 	defer s.invalidateDefinitionCache()
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -788,6 +847,9 @@ func (s *Store) DeleteMetricDataIfDisabled(ctx context.Context, name string) (bo
 
 	s.retentionMu.Lock()
 	defer s.retentionMu.Unlock()
+	if err := s.ensureOpen(); err != nil {
+		return false, err
+	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -835,6 +897,9 @@ func (s *Store) DeleteEntity(ctx context.Context, entityID string) (int64, error
 	}
 	s.retentionMu.Lock()
 	defer s.retentionMu.Unlock()
+	if err := s.ensureOpen(); err != nil {
+		return 0, err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -874,6 +939,9 @@ func (s *Store) DeleteSeries(ctx context.Context, filter Query) (int64, error) {
 	}
 	s.retentionMu.Lock()
 	defer s.retentionMu.Unlock()
+	if err := s.ensureOpen(); err != nil {
+		return 0, err
+	}
 	return s.deleteSeries(ctx, filter)
 }
 
@@ -918,10 +986,13 @@ func (s *Store) Write(ctx context.Context, point Point) error {
 	return s.WriteBatch(ctx, []Point{point})
 }
 
-// writeBatch writes one chunk of metric points through an executor.
-//
-// WriteBatch 批量写入采样点，并在大批量分块时保持整体事务性。
+// WriteBatch accepts a batch into the in-memory raw and rollup buffers. A
+// returned error means this batch was not accepted; persistence of earlier
+// buffers can make progress even when a later flush fails.
 func (s *Store) WriteBatch(ctx context.Context, points []Point) error {
+	if err := s.recoverUncertainFlush(ctx); err != nil {
+		return err
+	}
 	if err := s.ensureOpen(); err != nil {
 		return err
 	}
@@ -934,23 +1005,44 @@ func (s *Store) WriteBatch(ctx context.Context, points []Point) error {
 		return err
 	}
 	points, err := s.filterDisabledMetricPoints(ctx, points)
-	if err != nil {
+	if err != nil || len(points) == 0 {
 		return err
 	}
-	if len(points) == 0 {
-		return nil
-	}
-	s.ingestMu.Lock()
-	defer s.ingestMu.Unlock()
 	prepared, err := prepareMetricPoints(points)
 	if err != nil {
 		return err
 	}
-	rebuild, err := s.writeRawPoints(ctx, prepared)
+	s.ingestMu.Lock()
+	defer s.ingestMu.Unlock()
+	if err := s.ensureOpen(); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	// Flush only an existing, bounded chunk before accepting this batch. In
+	// particular, a coarse failure after a minute commit must not turn this
+	// incoming batch into an apparently failed but already accepted write.
+	flushed, err := s.flushClosedHotRollups(ctx, now)
 	if err != nil {
 		return err
 	}
-	return s.writePreparedHotRollups(ctx, prepared, time.Now().UTC(), rebuild)
+	if flushed == 0 {
+		if _, err := s.flushClosedCoarseRollups(ctx, now); err != nil {
+			return err
+		}
+	}
+	// Readers must never see a rebuilt hot bucket alongside the persisted
+	// version it replaces, or observe raw and rollup mutation halfway through.
+	s.rollupViewMu.Lock()
+	defer s.rollupViewMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	rebuild := s.writeRawPointsAt(prepared, now)
+	s.stagePreparedHotRollups(prepared, rebuild)
+	return nil
 }
 
 // filterDisabledMetricPoints rejects points without a definition and drops
@@ -1068,6 +1160,9 @@ func (s *Store) EntityIDs(ctx context.Context, query Query) ([]string, error) {
 	}
 	s.rollupViewMu.RLock()
 	defer s.rollupViewMu.RUnlock()
+	if err := s.ensureOpen(); err != nil {
+		return nil, err
+	}
 
 	args := []any{query.MetricName, bucketStartMillis(query.Start.UnixMilli(), time.Minute.Milliseconds()), query.End.UnixMilli()}
 	parts := []string{
@@ -1233,6 +1328,9 @@ func (s *Store) Stats(ctx context.Context, query Query) (Stats, error) {
 	query = query.normalized()
 	s.rollupViewMu.RLock()
 	defer s.rollupViewMu.RUnlock()
+	if err := s.ensureOpen(); err != nil {
+		return Stats{}, err
+	}
 	rows, err := s.scanRollupRowsBetween(ctx, query.MetricName, query.EntityID, query.Tags,
 		time.Minute.Milliseconds(), bucketStartMillis(query.Start.UnixMilli(), time.Minute.Milliseconds()), query.End.UnixMilli(), true)
 	if err != nil {
@@ -1242,7 +1340,18 @@ func (s *Store) Stats(ctx context.Context, query Query) (Stats, error) {
 	if err != nil {
 		return Stats{}, err
 	}
-	rows = append(rows, hot...)
+	// Rebuilt hot buckets replace, rather than add to, the same persisted
+	// minute (including an empty bucket when a label set was removed).
+	s.hotMu.RLock()
+	kept := rows[:0]
+	for _, row := range rows {
+		key := hotRollupKey{metricName: query.MetricName, entityID: row.entityID, tagsHash: row.bucketData.tagsHash, labelsHash: row.bucketData.labelsHash, bucket: row.bucket}
+		if _, replaced := s.hotReplace[key]; !replaced {
+			kept = append(kept, row)
+		}
+	}
+	s.hotMu.RUnlock()
+	rows = append(kept, hot...)
 	if len(rows) == 0 {
 		// No samples in range. Disambiguate from a non-existent metric so the
 		// caller can tell "empty window" apart from "unknown metric".
@@ -1290,6 +1399,9 @@ func (s *Store) DeleteBefore(ctx context.Context, metricName string, before time
 	}
 	s.retentionMu.Lock()
 	defer s.retentionMu.Unlock()
+	if err := s.ensureOpen(); err != nil {
+		return 0, err
+	}
 
 	before = before.UTC()
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -1334,6 +1446,9 @@ func (s *Store) CleanupExpired(ctx context.Context, now time.Time) (int64, error
 	}
 	s.retentionMu.Lock()
 	defer s.retentionMu.Unlock()
+	if err := s.ensureOpen(); err != nil {
+		return 0, err
+	}
 
 	defs, err := s.ListMetrics(ctx)
 	if err != nil {

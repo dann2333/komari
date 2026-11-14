@@ -369,7 +369,7 @@ func TestCompactDoesNotOverwriteCoarseRollupWithPartialFineRows(t *testing.T) {
 	if len(after) != 1 || after[0].Count != 300 {
 		t.Fatalf("coarse bucket was overwritten from partial fine rows: %#v", after)
 	}
-	if err := s.Write(ctx, Point{MetricName: "partial", EntityID: "n1", Timestamp: base.Add(4*time.Minute + 30*time.Second), Value: 1}); err != nil {
+	if err := s.Write(ctx, Point{MetricName: "partial", EntityID: "n1", Timestamp: base.Add(4*time.Minute + 30*time.Second + 500*time.Millisecond), Value: 1}); err != nil {
 		t.Fatalf("write late: %v", err)
 	}
 	if _, err := s.Compact(ctx, base.Add(19*time.Minute)); err != nil {
@@ -379,8 +379,8 @@ func TestCompactDoesNotOverwriteCoarseRollupWithPartialFineRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rollup after late: %v", err)
 	}
-	if len(late) != 1 || late[0].Count != 300 {
-		t.Fatalf("sealed coarse bucket was rewritten by a late minute: %#v", late)
+	if len(late) != 1 || late[0].Count != 301 {
+		t.Fatalf("valid late minute was not merged into the coarse bucket: %#v", late)
 	}
 	if _, err := s.Compact(ctx, base.Add(20*time.Minute)); err != nil {
 		t.Fatalf("compact late again: %v", err)
@@ -389,7 +389,7 @@ func TestCompactDoesNotOverwriteCoarseRollupWithPartialFineRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rollup after repeated compact: %v", err)
 	}
-	if len(again) != 1 || again[0].Count != 300 {
+	if len(again) != 1 || again[0].Count != 301 {
 		t.Fatalf("repeated compact rewrote sealed coarse bucket: %#v", again)
 	}
 }
@@ -416,9 +416,7 @@ func TestCompactMergesLateFineDeltaLargerThanCoarseBucket(t *testing.T) {
 		t.Fatalf("compact expire fine: %v", err)
 	}
 	for _, ts := range []time.Time{base.Add(20 * time.Second), base.Add(30 * time.Second)} {
-		if err := s.Write(ctx, Point{MetricName: "latebig", EntityID: "n1", Timestamp: ts, Value: 1}); err != nil {
-			t.Fatalf("write late: %v", err)
-		}
+		writeRollupPointsAt(t, ctx, s, base.Add(19*time.Minute), Point{MetricName: "latebig", EntityID: "n1", Timestamp: ts, Value: 1})
 	}
 	if _, err := s.Compact(ctx, base.Add(19*time.Minute)); err != nil {
 		t.Fatalf("compact late: %v", err)
@@ -431,8 +429,8 @@ func TestCompactMergesLateFineDeltaLargerThanCoarseBucket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rollup: %v", err)
 	}
-	if len(got) != 1 || got[0].Count != 1 {
-		t.Fatalf("late data rewrote the sealed coarse bucket: %#v", got)
+	if len(got) != 1 || got[0].Count != 3 {
+		t.Fatalf("late data was not merged into the sealed coarse bucket: %#v", got)
 	}
 }
 
@@ -1093,8 +1091,8 @@ func TestCompactWithRawRetentionOnlyWritesChangedBuckets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compact late: %v", err)
 	}
-	if late != 0 {
-		t.Fatalf("late compact rewrote %d buckets, want 0", late)
+	if late != 1 {
+		t.Fatalf("late compact sealed %d buckets, want 1", late)
 	}
 	got, err := s.aggregateRollupAt(ctx, AggregateQuery{
 		Query:       Query{MetricName: "incremental", EntityID: "n1", Start: base, End: base.Add(5*time.Minute - time.Nanosecond)},
@@ -1104,8 +1102,8 @@ func TestCompactWithRawRetentionOnlyWritesChangedBuckets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rollup: %v", err)
 	}
-	if len(got) != 1 || got[0].Count != 1 || got[0].Value != 1 {
-		t.Fatalf("explicit 5m query read a finer tier: %#v", got)
+	if len(got) != 1 || got[0].Count != 2 || got[0].Value != 3 {
+		t.Fatalf("coarse parent did not include both valid children: %#v", got)
 	}
 }
 

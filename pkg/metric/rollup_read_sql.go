@@ -27,6 +27,7 @@ type rollupReadPlan struct {
 	StartMilli   int64
 	EndMilli     int64
 	Fields       rollupReadFields
+	WithLabelID  bool
 }
 
 // Small resolved series sets should seek directly into each series, rather than
@@ -116,7 +117,7 @@ func (d sqliteDialect) renderRollupRead(tables tables, indexName string, plan ro
 	args := []any{plan.ResolutionID, plan.StartMilli, plan.EndMilli, string(seriesJSON)}
 	return renderedSQL{
 		Query: fmt.Sprintf("SELECT %s FROM %s r INDEXED BY %s WHERE r.resolution_id = %s AND r.bucket_milli >= %s AND r.bucket_milli <= %s AND r.series_id IN (SELECT CAST(value AS INTEGER) FROM json_each(%s)) ORDER BY r.bucket_milli ASC, r.series_id ASC, r.label_id ASC",
-			rollupReadColumns(plan.Fields), tables.rollups, indexName,
+			rollupReadColumns(plan.Fields, plan.WithLabelID), tables.rollups, indexName,
 			d.placeholder(1), d.placeholder(2), d.placeholder(3), d.placeholder(4)),
 		Args: args,
 	}
@@ -131,7 +132,7 @@ func (d mysqlDialect) renderRollupRead(tables tables, indexName string, plan rol
 	}
 	return renderedSQL{
 		Query: fmt.Sprintf("SELECT %s FROM %s r FORCE INDEX (%s) WHERE r.resolution_id = %s AND r.bucket_milli >= %s AND r.bucket_milli <= %s AND r.series_id IN (%s) ORDER BY r.bucket_milli ASC, r.series_id ASC, r.label_id ASC",
-			rollupReadColumns(plan.Fields), tables.rollups, indexName,
+			rollupReadColumns(plan.Fields, plan.WithLabelID), tables.rollups, indexName,
 			d.placeholder(1), d.placeholder(2), d.placeholder(3), strings.Join(seriesPlaceholders, ", ")),
 		Args: args,
 	}
@@ -141,14 +142,17 @@ func (d postgresDialect) renderRollupRead(tables tables, _ string, plan rollupRe
 	args := []any{plan.ResolutionID, plan.StartMilli, plan.EndMilli, plan.SeriesIDs}
 	return renderedSQL{
 		Query: fmt.Sprintf("SELECT %s FROM %s r WHERE r.resolution_id = %s AND r.bucket_milli >= %s AND r.bucket_milli <= %s AND r.series_id = ANY(%s::bigint[]) ORDER BY r.bucket_milli ASC, r.series_id ASC, r.label_id ASC",
-			rollupReadColumns(plan.Fields), tables.rollups,
+			rollupReadColumns(plan.Fields, plan.WithLabelID), tables.rollups,
 			d.placeholder(1), d.placeholder(2), d.placeholder(3), d.placeholder(4)),
 		Args: args,
 	}
 }
 
-func rollupReadColumns(fields rollupReadFields) string {
+func rollupReadColumns(fields rollupReadFields, withLabelID bool) string {
 	columns := []string{"r.series_id", "r.bucket_milli", "r.count"}
+	if withLabelID {
+		columns = append(columns, "r.label_id")
+	}
 	if fields&rollupReadSum != 0 {
 		columns = append(columns, "r.sum")
 	}

@@ -369,6 +369,11 @@ func (s *Store) Restructure(ctx context.Context, report func(RestructureProgress
 	if err := s.ensureOpen(); err != nil {
 		return RestructureResult{}, err
 	}
+	s.retentionMu.Lock()
+	defer s.retentionMu.Unlock()
+	if err := s.ensureOpen(); err != nil {
+		return RestructureResult{}, err
+	}
 	shape, err := s.inspectSchema(ctx)
 	if err != nil {
 		return RestructureResult{}, err
@@ -783,6 +788,7 @@ func (s *Store) discardNormalizedHistory(ctx context.Context, report func(Restru
 	s.hotMu.Lock()
 	clear(s.hot)
 	clear(s.hotReplace)
+	clear(s.hotReplaceGroups)
 	s.hotMu.Unlock()
 	if err := s.validateNormalizedRestructure(ctx, len(definitions)); err != nil {
 		return RestructureResult{}, fmt.Errorf("validate empty normalized schema: %w", err)

@@ -493,6 +493,10 @@ func TestRetentionCleanupReportsDeleteFailure(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("write compact fixtures: %v", err)
 	}
+	// Seed rows at their historical clock before exercising cleanup later.
+	if _, err := s.Flush(ctx, old.Add(time.Minute)); err != nil {
+		t.Fatalf("flush fixtures: %v", err)
+	}
 
 	rawDB, err := sql.Open("sqlite3", dsn)
 	if err != nil {

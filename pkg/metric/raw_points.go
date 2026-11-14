@@ -760,6 +760,9 @@ func compactRawLabels(series *rawSeries) {
 func (s *Store) latestRollupBefore(ctx context.Context, metricName, entityID string, before time.Time) (Point, bool, error) {
 	s.rollupViewMu.RLock()
 	defer s.rollupViewMu.RUnlock()
+	if err := s.ensureOpen(); err != nil {
+		return Point{}, false, err
+	}
 	end := before.Add(-time.Nanosecond)
 	endMilli := end.UnixMilli()
 	var latest Point
@@ -805,7 +808,7 @@ func (s *Store) latestRollupBefore(ctx context.Context, metricName, entityID str
 		return Point{}, false, err
 	}
 	for _, row := range hot {
-		if row.bucketData.lastTS > endMilli || (found && row.bucketData.lastTS <= latest.Timestamp.UnixMilli()) {
+		if row.bucketData.lastTS > endMilli || (found && row.bucketData.lastTS < latest.Timestamp.UnixMilli()) {
 			continue
 		}
 		tags, err := rollupTagsFromJSON(row.bucketData.tagsJSON)

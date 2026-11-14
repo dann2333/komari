@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"runtime"
 	"slices"
 	"time"
 )
@@ -28,6 +29,9 @@ type storedRollup struct {
 // enforces retention for explicit callers. The server's frequent compact task
 // uses Flush and FlushCoarse only; retention runs on its own hourly schedule.
 func (s *Store) Compact(ctx context.Context, now time.Time) (int, error) {
+	if err := s.recoverUncertainFlush(ctx); err != nil {
+		return 0, err
+	}
 	if err := s.ensureOpen(); err != nil {
 		return 0, err
 	}
@@ -51,23 +55,44 @@ func (s *Store) Compact(ctx context.Context, now time.Time) (int, error) {
 // It is used by the scheduled compactor so a series that stops reporting is
 // still persisted even when no later report arrives to close its last minute.
 func (s *Store) Flush(ctx context.Context, now time.Time) (int, error) {
-	if err := s.ensureOpen(); err != nil {
+	if err := s.recoverUncertainFlush(ctx); err != nil {
 		return 0, err
 	}
-	s.retentionMu.RLock()
-	defer s.retentionMu.RUnlock()
-	if err := s.ensureOpen(); err != nil {
-		return 0, err
-	}
-	s.ingestMu.Lock()
-	defer s.ingestMu.Unlock()
+	total := 0
 	now = now.UTC()
-	s.trimRawWindow(now)
-	written, err := s.flushClosedHotRollups(ctx, now)
-	if err != nil {
-		return 0, err
+	trimmed := false
+	for {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+		s.retentionMu.RLock()
+		if err := s.ensureOpen(); err != nil {
+			s.retentionMu.RUnlock()
+			return total, err
+		}
+		s.ingestMu.Lock()
+		if err := s.ensureOpen(); err != nil {
+			s.ingestMu.Unlock()
+			s.retentionMu.RUnlock()
+			return total, err
+		}
+		if !trimmed {
+			s.trimRawWindow(now)
+			trimmed = true
+		}
+		n, err := s.flushClosedHotRollups(ctx, now)
+		s.ingestMu.Unlock()
+		s.retentionMu.RUnlock()
+		total += n
+		if err != nil {
+			return total, err
+		}
+		if n == 0 {
+			return total, nil
+		}
+		// Let waiting ingestion and readers run before taking the next chunk.
+		runtime.Gosched()
 	}
-	return written, nil
 }
 
 func (s *Store) CompactMetric(ctx context.Context, metricName string, now time.Time) (int, error) {
@@ -76,6 +101,8 @@ func (s *Store) CompactMetric(ctx context.Context, metricName string, now time.T
 	}
 	s.retentionMu.RLock()
 	defer s.retentionMu.RUnlock()
+	s.ingestMu.Lock()
+	defer s.ingestMu.Unlock()
 	if err := s.ensureOpen(); err != nil {
 		return 0, err
 	}
@@ -199,6 +226,10 @@ func buildCoarserBucketsFromDelta(delta map[rollupKey]*rollupBucket, interval ti
 }
 
 func (s *Store) mergeRollupBucketsWithDictionaryTx(ctx context.Context, metricName string, interval time.Duration, buckets map[rollupKey]*rollupBucket, cache *rollupDictionaryCache, tx *sql.Tx) (int, error) {
+	return s.mergeRollupBucketsWithResultTx(ctx, metricName, interval, buckets, cache, tx, nil)
+}
+
+func (s *Store) mergeRollupBucketsWithResultTx(ctx context.Context, metricName string, interval time.Duration, buckets map[rollupKey]*rollupBucket, cache *rollupDictionaryCache, tx *sql.Tx, result map[rollupKey]*rollupBucket) (int, error) {
 	if len(buckets) == 0 {
 		return 0, nil
 	}
@@ -219,6 +250,9 @@ func (s *Store) mergeRollupBucketsWithDictionaryTx(ctx context.Context, metricNa
 		if old := existing[key]; old != nil {
 			old.mergeStored(bucket)
 			bucket = old
+		}
+		if result != nil {
+			result[key] = bucket
 		}
 		seriesID, err := cache.seriesID(ctx, s, tx, metricName, key, bucket.tagsJSON)
 		if err != nil {

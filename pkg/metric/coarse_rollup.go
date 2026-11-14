@@ -3,7 +3,9 @@ package metric
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"math"
+	"runtime"
 	"sort"
 	"time"
 )
@@ -45,10 +47,15 @@ func (s *Store) addMinuteParents(metricName string, policy RollupPolicy, minute 
 	for key, bucket := range minute {
 		parentStart := bucketStartMillis(key.bucket, interval.Milliseconds())
 		if parentStart+interval.Milliseconds()+coarseRollupGrace.Milliseconds() <= now.UTC().UnixMilli() {
-			// A parent that has already sealed must remain immutable. The minute
-			// row still records the late sample, but it is deliberately not fed
-			// back into a persisted coarse bucket.
-			continue
+			// A delayed minute replacement must still update an existing parent
+			// that has not yet been sealed to the database.
+			parentKey := coarseRollupKey{metricName: metricName, interval: interval, rollupKey: rollupKey{entityID: key.entityID, tagsHash: key.tagsHash, labelsHash: key.labelsHash, bucket: parentStart}}
+			s.coarseMu.RLock()
+			_, pending := s.coarse[parentKey]
+			s.coarseMu.RUnlock()
+			if !pending {
+				continue
+			}
 		}
 		eligible[key] = bucket
 	}
@@ -113,58 +120,78 @@ func (s *Store) flushClosedCoarseRollups(ctx context.Context, now time.Time) (in
 
 func (s *Store) flushClosedCoarseRollupsUnderView(ctx context.Context, now time.Time) (int, error) {
 	now = now.UTC()
-	written := 0
-	for {
-		closed := s.takeClosedCoarseRollups(now)
+	closed, token, originalAt := s.retryCoarse, s.retryCoarseToken, now
+	if len(closed) != 0 {
+		originalAt = s.retryCoarseAt
+		s.coarseMu.Lock()
+		for _, item := range closed {
+			delete(s.coarse, item.key)
+		}
+		s.coarseNextClose = 0
+		s.coarseMu.Unlock()
+	} else {
+		closed = s.takeClosedCoarseRollups(now)
 		if len(closed) == 0 {
-			return written, nil
+			return 0, nil
 		}
-		sealed, err := s.filterClosedCoarseRollups(ctx, closed)
-		if err != nil {
-			s.restoreClosedCoarseRollups(closed)
-			return written, err
-		}
-		if len(sealed) == 0 {
-			continue
-		}
-		n, err := s.persistClosedCoarseRollups(ctx, sealed)
-		if err != nil {
-			s.restoreClosedCoarseRollups(sealed)
-			return written, err
-		}
-		written += n
-		for _, item := range sealed {
-			if len(item.higher) == 0 {
-				continue
-			}
-			s.addCoarseChildren(item.key.metricName, item.higher[0], item.higher[1:], map[rollupKey]*rollupBucket{
-				item.key.rollupKey: item.bucket,
-			})
-		}
+		token = newFlushToken()
 	}
-}
-
-func (s *Store) filterClosedCoarseRollups(ctx context.Context, closed []closedCoarseRollup) ([]closedCoarseRollup, error) {
+	tx, alreadyCommitted, err := s.beginFlushTx(ctx, token)
+	if err != nil {
+		s.restoreClosedCoarseRollups(closed)
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if alreadyCommitted {
+		now = originalAt
+	}
 	policies := make(map[string]RollupPolicy)
-	filtered := make([]closedCoarseRollup, 0, len(closed))
-	for _, item := range closed {
+	sealed := make([]closedCoarseRollup, 0, len(closed))
+	for i := range closed {
+		item := &closed[i]
 		policy, ok := policies[item.key.metricName]
 		if !ok {
-			var err error
-			policy, err = s.metricRollupPolicy(ctx, item.key.metricName)
+			policy, err = s.metricRollupPolicyTx(ctx, item.key.metricName, tx)
 			if err != nil {
-				return nil, err
+				s.restoreClosedCoarseRollups(closed)
+				return 0, err
 			}
 			policies[item.key.metricName] = policy
 		}
+		item.higher = item.higher[:0]
 		for _, tier := range policy.Tiers {
-			if tier.Interval == item.key.interval {
-				filtered = append(filtered, item)
-				break
+			if tier.Interval == item.key.interval && tierRetainsBucket(tier, item.key.bucket, now) {
+				sealed = append(sealed, *item)
+			}
+			if tier.Interval > item.key.interval {
+				item.higher = append(item.higher, tier.Interval)
 			}
 		}
 	}
-	return filtered, nil
+	if !alreadyCommitted {
+		if _, err := s.persistClosedCoarseRollups(ctx, sealed, tx); err != nil {
+			s.restoreClosedCoarseRollups(closed)
+			return 0, err
+		}
+	}
+	if err := s.commitFlushTx(tx, token); err != nil {
+		s.restoreClosedCoarseRollups(closed)
+		var uncertain *flushCommitError
+		if len(s.retryCoarse) != 0 || errors.As(err, &uncertain) {
+			s.retryCoarse, s.retryCoarseToken, s.retryCoarseAt = closed, token, now
+			s.setFlushUncertain(true)
+		}
+		return 0, err
+	}
+	// Expired fine parents can still have valid data for a coarser tier.
+	for _, item := range closed {
+		if len(item.higher) != 0 {
+			s.addCoarseChildren(item.key.metricName, item.higher[0], item.higher[1:], map[rollupKey]*rollupBucket{item.key.rollupKey: item.bucket})
+		}
+	}
+	s.retryCoarse, s.retryCoarseToken, s.retryCoarseAt = nil, "", time.Time{}
+	s.setFlushUncertain(false)
+	return len(closed), nil
 }
 
 func (s *Store) takeClosedCoarseRollups(now time.Time) []closedCoarseRollup {
@@ -195,6 +222,9 @@ func (s *Store) takeClosedCoarseRollups(now time.Time) []closedCoarseRollup {
 	for key, parent := range s.coarse {
 		if key.interval != interval || coarseCloseAt(key) > nowMilli {
 			continue
+		}
+		if len(closed) == hotRollupFlushBatchSize {
+			break
 		}
 		bucket := newRollupBucket(s.cfg.RollupPolicy.compression())
 		childKeys := make([]rollupKey, 0, len(parent.children))
@@ -245,13 +275,7 @@ func (s *Store) restoreClosedCoarseRollups(closed []closedCoarseRollup) {
 	}
 }
 
-func (s *Store) persistClosedCoarseRollups(ctx context.Context, closed []closedCoarseRollup) (int, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = tx.Rollback() }()
-
+func (s *Store) persistClosedCoarseRollups(ctx context.Context, closed []closedCoarseRollup, tx *sql.Tx) (int, error) {
 	byMetric := make(map[string]map[time.Duration]map[rollupKey]*rollupBucket)
 	for _, item := range closed {
 		byInterval := byMetric[item.key.metricName]
@@ -281,79 +305,55 @@ func (s *Store) persistClosedCoarseRollups(ctx context.Context, closed []closedC
 		}
 		sort.Slice(intervals, func(i, j int) bool { return intervals[i] < intervals[j] })
 		for _, interval := range intervals {
-			n, err := s.upsertClosedCoarseBucketsTx(ctx, name, interval, byMetric[name][interval], cache, tx)
+			n, err := s.mergeRollupBucketsWithDictionaryTx(ctx, name, interval, byMetric[name][interval], cache, tx)
 			if err != nil {
 				return written, err
 			}
 			written += n
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		return written, err
-	}
 	return written, nil
-}
-
-// upsertClosedCoarseBucketsTx writes a fully sealed parent exactly once. It
-// intentionally bypasses the minute-tier read/merge path: a parent cannot be
-// incrementally updated after this point, and re-reading it would reintroduce
-// the avoidable I/O this accumulator exists to remove.
-func (s *Store) upsertClosedCoarseBucketsTx(ctx context.Context, metricName string, interval time.Duration, buckets map[rollupKey]*rollupBucket, cache *rollupDictionaryCache, tx *sql.Tx) (int, error) {
-	if len(buckets) == 0 {
-		return 0, nil
-	}
-	keys := make([]rollupKey, 0, len(buckets))
-	for key := range buckets {
-		keys = append(keys, key)
-	}
-	sortRollupKeys(keys)
-	rows := make([]normalizedRollupRow, 0, len(keys))
-	for _, key := range keys {
-		bucket := buckets[key]
-		key.bucket = normalizeBucketMillis(key.bucket)
-		seriesID, err := cache.seriesID(ctx, s, tx, metricName, key, bucket.tagsJSON)
-		if err != nil {
-			return 0, err
-		}
-		labelID, err := cache.labelID(ctx, s, tx, key.labelsHash, bucket.labelsJSON)
-		if err != nil {
-			return 0, err
-		}
-		resolutionID, err := cache.resolutionID(ctx, s, tx, interval)
-		if err != nil {
-			return 0, err
-		}
-		rows = append(rows, normalizedRollupRow{
-			seriesID: seriesID, resolutionID: resolutionID, labelID: labelID,
-			bucketMilli: key.bucket, count: bucket.count, sum: bucket.sum, sumSq: bucket.sumSq,
-			min: bucket.min, max: bucket.max, firstVal: bucket.firstVal, firstTSMilli: bucket.firstTS,
-			lastVal: bucket.lastVal, lastTSMilli: bucket.lastTS, digest: bucket.encodedDigest(),
-			createdAtMilli: timeMillis(time.Now()),
-		})
-	}
-	for start := 0; start < len(rows); start += coarseRollupWriteBatchSize {
-		end := start + coarseRollupWriteBatchSize
-		if end > len(rows) {
-			end = len(rows)
-		}
-		if err := s.upsertNormalizedRollupRowsTx(ctx, rows[start:end], tx); err != nil {
-			return 0, err
-		}
-	}
-	return len(rows), nil
 }
 
 // FlushCoarse seals due in-memory parent buckets. It is primarily called by
 // the scheduled compactor so a series that stops reporting still closes.
 func (s *Store) FlushCoarse(ctx context.Context, now time.Time) (int, error) {
-	if err := s.ensureOpen(); err != nil {
+	if err := s.recoverUncertainFlush(ctx); err != nil {
 		return 0, err
 	}
-	s.retentionMu.RLock()
-	defer s.retentionMu.RUnlock()
-	s.ingestMu.Lock()
-	defer s.ingestMu.Unlock()
-	return s.flushClosedCoarseRollups(ctx, now)
+	total := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+		s.retentionMu.RLock()
+		if err := s.ensureOpen(); err != nil {
+			s.retentionMu.RUnlock()
+			return total, err
+		}
+		s.ingestMu.Lock()
+		if err := s.ensureOpen(); err != nil {
+			s.ingestMu.Unlock()
+			s.retentionMu.RUnlock()
+			return total, err
+		}
+		// Do not seal a parent ahead of a still-pending minute replacement.
+		hot, err := s.flushClosedHotRollups(ctx, now)
+		n := 0
+		if err == nil && hot == 0 {
+			n, err = s.flushClosedCoarseRollups(ctx, now)
+		}
+		s.ingestMu.Unlock()
+		s.retentionMu.RUnlock()
+		total += n
+		if err != nil {
+			return total, err
+		}
+		if hot == 0 && n == 0 {
+			return total, nil
+		}
+		runtime.Gosched()
+	}
 }
 
 func (s *Store) metricRollupPolicyTx(ctx context.Context, metricName string, tx *sql.Tx) (RollupPolicy, error) {

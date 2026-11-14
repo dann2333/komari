@@ -39,6 +39,7 @@ var (
 const (
 	reportBatchInterval     = 3 * time.Second
 	reportBatchQueueSize    = 512
+	reportBatchMaxReports   = 512
 	pingBatchQueueSize      = 4096
 	pingBatchMaxRecords     = 512
 	reportBatchWriteTimeout = 10 * time.Second
@@ -276,18 +277,19 @@ func drainQueue[T any](queue <-chan T, limit int) []T {
 	return items
 }
 
-// writePendingReports commits all pending reports as one batch and keeps them
-// for the next attempt when the write fails.
+// writePendingReports commits bounded prefixes in order. On failure the
+// unaccepted prefix and all following reports remain pending for retry.
 func writePendingReports(ctx context.Context, pending *[]v2.Report) error {
-	if len(*pending) == 0 {
-		return nil
+	for len(*pending) > 0 {
+		size := min(len(*pending), reportBatchMaxReports)
+		writeCtx, cancel := context.WithTimeout(ctx, reportBatchWriteTimeout)
+		_, err := writeReportBatch(writeCtx, (*pending)[:size])
+		cancel()
+		if err != nil {
+			return err
+		}
+		*pending = (*pending)[size:]
 	}
-	writeCtx, cancel := context.WithTimeout(ctx, reportBatchWriteTimeout)
-	defer cancel()
-	if _, err := writeReportBatch(writeCtx, *pending); err != nil {
-		return err
-	}
-	*pending = (*pending)[:0]
 	return nil
 }
 

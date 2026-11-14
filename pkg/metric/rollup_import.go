@@ -24,6 +24,11 @@ func (s *Store) ReplaceRollupPoints(ctx context.Context, interval time.Duration,
 	}
 	s.retentionMu.RLock()
 	defer s.retentionMu.RUnlock()
+	s.ingestMu.Lock()
+	defer s.ingestMu.Unlock()
+	if err := s.ensureOpen(); err != nil {
+		return err
+	}
 	points, err := s.filterDisabledMetricPoints(ctx, points)
 	if err != nil || len(points) == 0 {
 		return err
@@ -117,6 +122,11 @@ func (s *Store) RebuildCoarserRollups(ctx context.Context, source time.Duration)
 
 	s.retentionMu.RLock()
 	defer s.retentionMu.RUnlock()
+	s.ingestMu.Lock()
+	defer s.ingestMu.Unlock()
+	if err := s.ensureOpen(); err != nil {
+		return err
+	}
 	defs, err := s.ListMetrics(ctx)
 	if err != nil {
 		return err

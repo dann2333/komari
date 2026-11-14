@@ -186,6 +186,13 @@ func TestReportBatchRetryDoesNotCountHistoricalTraffic(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			if !existingBaseline {
+				// A previously accepted closed minute makes the next batch's
+				// pre-acceptance flush fail when the database is unavailable.
+				if err := s.Write(ctx, metric.Point{MetricName: MetricCPU, EntityID: "seed", Timestamp: base, Value: 42}); err != nil {
+					t.Fatal(err)
+				}
+			}
 			first := report
 			first.UpdatedAt = base.Add(3 * time.Second)
 			first.Network.TotalUp += 100
@@ -836,5 +843,55 @@ func assertMetricAggregate(t *testing.T, s *metric.Store, metricName, entityID s
 	}
 	if len(points) != 1 || points[0].Value != want || points[0].Count != wantCount {
 		t.Fatalf("aggregate %s = %#v, want value=%v count=%d", metricName, points, want, wantCount)
+	}
+}
+
+func TestPendingReportsKeepFailedSuffixAfterBoundedPrefix(t *testing.T) {
+	ctx := context.Background()
+	s := useReportTestStore(t, nil)
+	base := time.Now().UTC().Truncate(time.Minute).Add(-2 * time.Minute)
+	pending := make([]v2.Report, reportBatchMaxReports+3)
+	for i := range pending {
+		pending[i] = v2.Report{UUID: fmt.Sprintf("chunk-node-%d", i), UpdatedAt: base, CPU: v2.CPUReport{Usage: float64(i)}, Network: v2.NetworkReport{TotalUp: int64(1000 + i), TotalDown: int64(2000 + i)}}
+	}
+	if _, err := s.ExecContext(ctx, `CREATE TRIGGER fail_next_report_chunk BEFORE INSERT ON metric_rollups BEGIN SELECT RAISE(ABORT,'retry next chunk'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := writePendingReports(ctx, &pending); err == nil {
+		t.Fatal("expected second prefix to fail")
+	}
+	if len(pending) != 3 || pending[0].UUID != fmt.Sprintf("chunk-node-%d", reportBatchMaxReports) {
+		t.Fatalf("remaining prefix: %#v", pending)
+	}
+	value, ok := reportTrafficStates.Load("chunk-node-0")
+	if !ok {
+		t.Fatal("accepted prefix has no traffic state")
+	}
+	state := value.(*reportTrafficState)
+	state.mu.Lock()
+	baseline := state.reportTrafficValues
+	state.mu.Unlock()
+	if !baseline.hasUp || baseline.totalUp != 1000 {
+		t.Fatalf("accepted baseline: %#v", baseline)
+	}
+	value, ok = reportTrafficStates.Load(pending[0].UUID)
+	if !ok {
+		t.Fatal("failed prefix has no restored baseline")
+	}
+	state = value.(*reportTrafficState)
+	state.mu.Lock()
+	baseline = state.reportTrafficValues
+	state.mu.Unlock()
+	if baseline.hasUp || baseline.hasDown || !baseline.timestamp.IsZero() {
+		t.Fatalf("failed prefix advanced baseline: %#v", baseline)
+	}
+	if _, err := s.ExecContext(ctx, `DROP TRIGGER fail_next_report_chunk`); err != nil {
+		t.Fatal(err)
+	}
+	if err := writePendingReports(ctx, &pending); err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("pending after retry=%d", len(pending))
 	}
 }

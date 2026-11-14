@@ -3,6 +3,9 @@ package metric
 import "errors"
 
 var (
+	// ErrFlushCommitUncertain prevents a mixed database/buffer view until a
+	// rollup transaction with a lost commit response has been resolved.
+	ErrFlushCommitUncertain = errors.New("metric: rollup commit outcome is uncertain")
 	// ErrInvalidArgument reports an invalid caller-supplied argument.
 	//
 	// ErrInvalidArgument 表示调用方传入了无效参数。

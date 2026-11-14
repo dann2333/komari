@@ -100,13 +100,10 @@ func TestSeriesHybridEndEqualsCutoff(t *testing.T) {
 	now := time.Date(2026, 6, 18, 12, 0, 0, 0, time.UTC)
 	cutoff := time.Date(2026, 6, 18, 11, 30, 0, 0, time.UTC)
 	old := time.Date(2026, 6, 18, 11, 0, 10, 0, time.UTC) // rolled up, raw deleted
-	if err := s.Write(ctx, Point{MetricName: "endcut", EntityID: "n1", Timestamp: old, Value: 10}); err != nil {
-		t.Fatalf("write old: %v", err)
-	}
-	// Point exactly at the cutoff: kept as raw (not < cutoff) after compaction.
-	if err := s.Write(ctx, Point{MetricName: "endcut", EntityID: "n1", Timestamp: cutoff, Value: 100}); err != nil {
-		t.Fatalf("write cutoff: %v", err)
-	}
+	// Use the same simulated clock for ingestion and compaction.
+	writeRollupPointsAt(t, ctx, s, now,
+		Point{MetricName: "endcut", EntityID: "n1", Timestamp: old, Value: 10},
+		Point{MetricName: "endcut", EntityID: "n1", Timestamp: cutoff, Value: 100})
 	if _, err := s.Compact(ctx, now); err != nil {
 		t.Fatalf("compact: %v", err)
 	}

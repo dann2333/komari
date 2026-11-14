@@ -39,10 +39,9 @@ func TestRollupKeepsTagSeriesSeparate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compact: %v", err)
 	}
-	// Historical minutes are written directly by WriteBatch, so Compact has no
-	// remaining hot buckets to seal.
-	if written != 0 {
-		t.Fatalf("compact unexpectedly rewrote %d rollup buckets", written)
+	// Historical minutes are first staged in memory and sealed by Compact.
+	if written != 2 {
+		t.Fatalf("compact sealed %d rollup buckets, want 2", written)
 	}
 
 	q := func(dev string) AggregateQuery {
